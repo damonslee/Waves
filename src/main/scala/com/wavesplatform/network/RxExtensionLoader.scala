@@ -1,7 +1,8 @@
 package com.wavesplatform.network
 
+import cats.Eq
 import com.wavesplatform.network.RxExtensionLoader.ApplierState.Buffer
-import com.wavesplatform.network.RxExtensionLoader.LoaderState.WithPeer
+import com.wavesplatform.network.RxExtensionLoader.LoaderState.{ExpectingBlocks, ExpectingSignatures, WithPeer}
 import com.wavesplatform.network.RxScoreObserver.{ChannelClosedAndSyncWith, SyncWith}
 import io.netty.channel._
 import monix.eval.{Coeval, Task}
@@ -39,7 +40,6 @@ object RxExtensionLoader extends ScorexLogging {
       peerDatabase.blacklistAndClose(ch, reason)
     }.delayExecution(syncTimeOut)
 
-
     def syncNext(state: State, syncWith: SyncWith = lastSyncWith().flatten): State =
       syncWith match {
         case None =>
@@ -59,10 +59,20 @@ object RxExtensionLoader extends ScorexLogging {
               maybeKnownSigs match {
                 case Some((knownSigs, optimistic)) =>
                   val ch = best.channel
-                  log.debug(s"${id(ch)} Requesting extension signatures ${if (optimistic) "optimistically" else ""}, last ${knownSigs.length} are ${formatSignatures(knownSigs)}")
-                  val blacklisting = scheduleBlacklist(ch, s"Timeout loading extension").runAsync
-                  Task(ch.writeAndFlush(GetSignatures(knownSigs))).logErr.runAsync
-                  state.withLoaderState(LoaderState.ExpectingSignatures(ch, knownSigs, blacklisting))
+                  //if (ch.isActive) {
+                    log.debug(s"${id(ch)} Requesting extension signatures${if (optimistic) " optimistically" else ""}, last ${knownSigs.length} are ${formatSignatures(knownSigs)}")
+                    val blacklisting = scheduleBlacklist(ch, s"Timeout loading extension").runAsync
+                    ch.writeAndFlush(GetSignatures(knownSigs)).addListener { (future: ChannelFuture) =>
+                      Option(future.cause()) match {
+                        case Some(e) => log.error(s"${id(ch)} Can't send GetSignatures", e)
+                        case None =>
+                      }
+
+                      if (future.isSuccess) log.trace(s"${id(ch)} Sent GetSignatures")
+                    }
+
+                    state.withLoaderState(LoaderState.ExpectingSignatures(ch, knownSigs, blacklisting))
+                  //} else state
                 case None =>
                   log.trace(s"Holding on requesting next sigs, $state")
                   state
@@ -72,6 +82,7 @@ object RxExtensionLoader extends ScorexLogging {
 
     def onNewSyncWithChannelClosed(state: State, cc: ChannelClosedAndSyncWith): State = {
       cc match {
+        case ChannelClosedAndSyncWith(None, None) => state
         case ChannelClosedAndSyncWith(_, None) =>
           state.loaderState match {
             case _: LoaderState.WithPeer => state.withIdleLoader
@@ -109,7 +120,15 @@ object RxExtensionLoader extends ScorexLogging {
               } else {
                 log.trace(s"${id(ch)} Requesting all required blocks(size=${unknown.size})")
                 val blacklistingAsync = scheduleBlacklist(ch, "Timeout loading first requested block").runAsync
-                Task(unknown.foreach(s => ch.writeAndFlush(GetBlock(s)))).logErr.runAsync
+                unknown.foreach { s =>
+                  ch.writeAndFlush(GetBlock(s)).addListener { (future: ChannelFuture) =>
+                    Option(future.cause()) match {
+                      case Some(e) => log.error(s"Can't send ${GetBlock(s)}", e)
+                      case None =>
+                    }
+                  }
+                }
+
                 state.withLoaderState(LoaderState.ExpectingBlocks(ch, unknown, unknown.toSet, Set.empty, blacklistingAsync))
               }
           }
@@ -194,11 +213,25 @@ object RxExtensionLoader extends ScorexLogging {
 
     Observable
       .merge(
-        signatures.observeOn(scheduler).map { case ((ch, sigs)) => s = onNewSignatures(s, ch, sigs) },
-        blocks.observeOn(scheduler).map { case ((ch, block)) => s = onBlock(s, ch, block) },
-        syncWithChannelClosed.observeOn(scheduler).map { ch => s = onNewSyncWithChannelClosed(s, ch) }
+        signatures.observeOn(scheduler).map { case ((ch, sigs)) =>
+          log.trace(s"signatures: ($ch, $sigs)")
+          onNewSignatures(s, ch, sigs)
+        },
+        blocks.observeOn(scheduler).map { case ((ch, block)) =>
+          log.trace(s"blocks: ($ch, $block)")
+          onBlock(s, ch, block)
+        },
+        syncWithChannelClosed.observeOn(scheduler).map { ch =>
+          log.trace(s"syncWithChannelClosed: $ch")
+          onNewSyncWithChannelClosed(s, ch)
+        }
       )
-      .map { _ => log.trace(s"Current state: $s") }
+      .distinctUntilChanged(Eq.fromUniversalEquals)
+      .map { newS =>
+        log.trace(s"$s -> $newS")
+        s = newS
+        s
+      }
       .logErr
       .subscribe()(scheduler)
 
@@ -209,19 +242,20 @@ object RxExtensionLoader extends ScorexLogging {
 
   object LoaderState {
 
+    case object Idle extends LoaderState
+
     sealed trait WithPeer extends LoaderState {
       def channel: Channel
 
       def timeout: CancelableFuture[Unit]
     }
 
-    case object Idle extends LoaderState
-
     case class ExpectingSignatures(channel: Channel, known: Seq[BlockId], timeout: CancelableFuture[Unit]) extends WithPeer {
       override def toString: String = s"ExpectingSignatures(channel=${id(channel)})"
     }
 
-    case class ExpectingBlocks(channel: Channel, allBlocks: Seq[BlockId],
+    case class ExpectingBlocks(channel: Channel,
+                               allBlocks: Seq[BlockId],
                                expected: Set[BlockId],
                                received: Set[Block],
                                timeout: CancelableFuture[Unit]) extends WithPeer {
@@ -253,11 +287,11 @@ object RxExtensionLoader extends ScorexLogging {
 
     case object Idle extends ApplierState
 
+    case class Applying(buf: Option[Buffer], applying: ExtensionBlocks) extends ApplierState
+
     case class Buffer(ch: Channel, ext: ExtensionBlocks) {
       override def toString: String = s"Buffer($ext from ${id(ch)})"
     }
-
-    case class Applying(buf: Option[Buffer], applying: ExtensionBlocks) extends ApplierState
 
   }
 
