@@ -325,7 +325,7 @@ object NodeApi extends ScorexLogging {
   case class UnexpectedStatusCodeException(request: Request, response: Response) extends Exception(s"Request: ${request.getUrl}\n" +
     s"Unexpected status code (${response.getStatusCode}): ${response.getResponseBody}")
 
-  case class Status(blockGeneratorStatus: Option[String], historySynchronizationStatus: Option[String])
+  case class Status(blockchainHeight: Int, stateHeight: Int, updatedTimestamp: Long, updatedDate: String)
 
   implicit val statusFormat: Format[Status] = Json.format
 
